@@ -1,0 +1,11 @@
+.venv/
+.tools/
+__pycache__/
+.pytest_cache/
+.streamlit/secrets.toml
+.DS_Store
+*.pyc
+data/daily/*.csv
+data/index/*.csv
+data/stock_list.csv
+config/ui_defaults.json
