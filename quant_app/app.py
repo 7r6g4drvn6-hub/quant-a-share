@@ -643,56 +643,60 @@ with market_tab:
             st.caption("行情预测是基于指数历史相似状态的概率信号，不是确定性判断。")
 
         st.subheader("板块行情判断")
-        board_sample_size = min(len(selected_codes), 600)
-        board_codes = selected_codes[:board_sample_size]
-        try:
-            board_quotes = cached_realtime_quotes(tuple(board_codes))
-        except Exception as exc:  # noqa: BLE001
-            st.warning(f"板块实时行情加载失败：{exc}")
-            return
+        board_sample_size = min(len(selected_codes), 300)
+        st.caption(
+            f"点击后会基于当前样本中成交额靠前 {board_sample_size} 只股票生成板块判断，"
+            "避免首屏自动拉取过多实时行情。"
+        )
+        if st.button("生成板块行情判断", width="stretch"):
+            board_codes = selected_codes[:board_sample_size]
+            try:
+                board_quotes = cached_realtime_quotes(tuple(board_codes))
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"板块实时行情加载失败：{exc}")
+                return
 
-        board_summary, board_view = board_market_judgment(board_quotes, stock_list)
-        if not board_summary or board_view.empty:
-            st.warning("当前样本无法生成板块行情判断。")
-        else:
-            board_cols = st.columns(5)
-            board_cols[0].metric("行情判断", str(board_summary["market_view"]))
-            board_cols[1].metric("上涨占比", pct(board_summary["overall_up_ratio"]))
-            board_cols[2].metric("加权涨跌", f"{board_summary['overall_weighted_pct_change']:.2f}%")
-            board_cols[3].metric("强势板块", f"{board_summary['strong_board_count']}/{board_summary['board_count']}")
-            board_cols[4].metric("领涨板块", f"{board_summary['leading_board']}")
-            st.dataframe(
-                table_view(
-                    board_view.head(20),
-                    [
-                        "rank",
-                        "board_name",
-                        "market_status",
-                        "board_score",
-                        "quote_count",
-                        "up_ratio",
-                        "weighted_pct_change",
-                        "amount_yi",
-                        "amount_share",
-                        "strong_count",
-                        "limit_up_count",
-                        "limit_down_count",
-                        "leader_code",
-                        "leader_name",
-                        "leader_pct_change",
-                        "laggard_name",
-                        "laggard_pct_change",
-                        "quote_time",
-                    ],
-                ),
-                width="stretch",
-                hide_index=True,
-            )
-            st.caption(
-                f"板块判断基于当前样本中成交额靠前 {board_sample_size} 只股票，"
-                "按成交额加权涨跌幅、上涨家数占比和成交额占比综合排序；"
-                "没有 Tushare 行业字段时，先按主板/创业板/科创板等市场分组。"
-            )
+            board_summary, board_view = board_market_judgment(board_quotes, stock_list)
+            if not board_summary or board_view.empty:
+                st.warning("当前样本无法生成板块行情判断。")
+            else:
+                board_cols = st.columns(5)
+                board_cols[0].metric("行情判断", str(board_summary["market_view"]))
+                board_cols[1].metric("上涨占比", pct(board_summary["overall_up_ratio"]))
+                board_cols[2].metric("加权涨跌", f"{board_summary['overall_weighted_pct_change']:.2f}%")
+                board_cols[3].metric("强势板块", f"{board_summary['strong_board_count']}/{board_summary['board_count']}")
+                board_cols[4].metric("领涨板块", f"{board_summary['leading_board']}")
+                st.dataframe(
+                    table_view(
+                        board_view.head(20),
+                        [
+                            "rank",
+                            "board_name",
+                            "market_status",
+                            "board_score",
+                            "quote_count",
+                            "up_ratio",
+                            "weighted_pct_change",
+                            "amount_yi",
+                            "amount_share",
+                            "strong_count",
+                            "limit_up_count",
+                            "limit_down_count",
+                            "leader_code",
+                            "leader_name",
+                            "leader_pct_change",
+                            "laggard_name",
+                            "laggard_pct_change",
+                            "quote_time",
+                        ],
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.caption(
+                    "板块判断按成交额加权涨跌幅、上涨家数占比和成交额占比综合排序；"
+                    "没有 Tushare 行业字段时，先按主板/创业板/科创板等市场分组。"
+                )
 
     market_index_panel()
 
