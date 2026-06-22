@@ -37,6 +37,13 @@ from quant_app.strategy import (
     optimize_trade_plan,
     operation_recommendations,
 )
+from quant_app.risk import (
+    add_group_neutral_rank,
+    build_factor_snapshot,
+    factor_exposure,
+    group_exposure,
+    run_parameter_scan,
+)
 
 
 st.set_page_config(page_title="A股量化研究台", page_icon="Q", layout="wide")
@@ -176,6 +183,48 @@ COLUMN_LABELS = {
     "amount_ratio_rt": "放量倍数",
     "distance_to_ma_short": "偏离短均线",
     "score": "评分",
+    "neutral_rank": "中性排名",
+    "risk_group": "风险分组",
+    "group_rank": "组内排名",
+    "factor_score": "综合因子",
+    "trend_strength": "趋势强度",
+    "liquidity_score": "流动性因子",
+    "low_vol_score": "低波动因子",
+    "value_score": "估值因子",
+    "momentum_score": "动量因子",
+    "volatility_20": "20日波动率",
+    "volatility_60": "60日波动率",
+    "drawdown_60": "60日回撤",
+    "position_weight": "持仓权重",
+    "position_count": "持仓数量",
+    "universe_weight": "股票池权重",
+    "universe_count": "股票池数量",
+    "active_weight": "主动偏离",
+    "factor": "因子",
+    "portfolio_value": "组合值",
+    "universe_value": "股票池均值",
+    "active_value": "主动暴露",
+    "interpretation": "解释",
+    "ma_short_param": "短均线",
+    "ma_long_param": "长均线",
+    "momentum_window_param": "动量窗口",
+    "top_n_param": "持仓数量",
+    "final_equity": "最终净值",
+    "total_return": "累计收益",
+    "annual_return": "年化收益",
+    "annual_volatility": "年化波动",
+    "sharpe": "夏普",
+    "max_drawdown": "最大回撤",
+    "win_rate": "胜率",
+    "avg_turnover": "平均换手",
+    "trading_status": "交易状态",
+    "t1_locked": "T+1锁定",
+    "sellable_shares": "可卖股数",
+    "limit_up": "涨停价",
+    "limit_down": "跌停价",
+    "limit_pct": "涨跌停幅度",
+    "can_buy": "可买",
+    "can_sell": "可卖",
     "quote_time": "行情时间",
     "quote_datetime": "行情日期时间",
     "direction": "明日方向",
@@ -198,7 +247,11 @@ COLUMN_LABELS = {
 def table_view(df: pd.DataFrame, columns: list[str] | None = None) -> pd.DataFrame:
     if df.empty:
         return df
-    view = df[columns].copy() if columns else df.copy()
+    if columns:
+        existing_columns = [column for column in columns if column in df.columns]
+        view = df[existing_columns].copy()
+    else:
+        view = df.copy()
     return view.rename(columns={column: COLUMN_LABELS.get(column, column) for column in view.columns})
 
 
@@ -215,12 +268,13 @@ def parse_holdings_text(text: str) -> pd.DataFrame:
             code = normalize_code(parts[0])
             shares = float(parts[1])
             cost_price = float(parts[2]) if len(parts) >= 3 else pd.NA
+            buy_date = pd.to_datetime(parts[3], errors="coerce") if len(parts) >= 4 else pd.NaT
         except ValueError:
             continue
         if shares <= 0:
             continue
-        rows.append({"code": code, "shares": shares, "cost_price": cost_price})
-    return pd.DataFrame(rows, columns=["code", "shares", "cost_price"])
+        rows.append({"code": code, "shares": shares, "cost_price": cost_price, "buy_date": buy_date})
+    return pd.DataFrame(rows, columns=["code", "shares", "cost_price", "buy_date"])
 
 
 @st.cache_data(ttl=300)
@@ -381,6 +435,10 @@ with st.sidebar:
     min_listed_days = st.slider("上市天数下限", min_value=30, max_value=500, value=120, step=10)
     cost_bps = st.slider("单边成本 bps", min_value=0.0, max_value=50.0, value=8.0, step=1.0)
 
+    st.subheader("风控")
+    max_per_group = st.slider("单组最多入选", min_value=1, max_value=10, value=3, step=1)
+    scan_grid_size = st.select_slider("参数扫描范围", options=["关闭", "小", "中"], value="小")
+
     st.subheader("实时")
     realtime_auto_refresh = st.toggle("自动刷新", value=True)
     refresh_seconds = st.slider("刷新秒数", min_value=10, max_value=120, value=30, step=10)
@@ -453,6 +511,7 @@ panel = build_panel(
     ma_long=ma_long,
     momentum_window=momentum_window,
 )
+factor_snapshot = build_factor_snapshot(panel, stock_list)
 
 equity, holdings, metrics = run_backtest(
     panel,
@@ -465,8 +524,8 @@ equity, holdings, metrics = run_backtest(
 if refresh_realtime:
     cached_realtime_quotes.clear()
 
-market_tab, realtime_tab, operation_tab, prediction_tab, data_tab, backtest_tab, pick_tab, detail_tab = st.tabs(
-    ["市场", "实时", "操作", "预测", "数据", "回测", "选股", "个股"]
+market_tab, realtime_tab, operation_tab, prediction_tab, data_tab, backtest_tab, pick_tab, risk_tab, scan_tab, detail_tab = st.tabs(
+    ["市场", "实时", "操作", "预测", "数据", "回测", "选股", "风控", "扫描", "个股"]
 )
 realtime_run_every = refresh_seconds if realtime_auto_refresh else None
 
@@ -622,9 +681,10 @@ with operation_tab:
     max_buy_candidates = plan_col5.slider("最多买入", min_value=1, max_value=20, value=min(5, top_n), step=1)
     holdings_text = plan_col6.text_area(
         "现有持仓",
-        placeholder="600000,1000,8.50\n000001,500,10.20",
+        placeholder="600000,1000,8.50,2026-06-22\n000001,500,10.20,2026-06-19",
         height=90,
     )
+    st.caption("持仓格式：代码,股数,成本价,买入日期。买入日期为今天的持仓会按 A 股 T+1 规则锁定为不可卖。")
     holdings_df = parse_holdings_text(holdings_text)
 
     @st.fragment(run_every=realtime_run_every)
@@ -668,6 +728,7 @@ with operation_tab:
                 reserve_cash_pct=reserve_cash_pct,
                 max_position_pct=max_position_pct,
                 max_buy_candidates=max_buy_candidates,
+                trade_date=end_date,
             )
             actionable = trade_plan[trade_plan["trade_shares"] != 0].copy() if not trade_plan.empty else pd.DataFrame()
             planned_buy_value = actionable[actionable["trade_value"] > 0]["trade_value"].sum() if not actionable.empty else 0.0
@@ -696,12 +757,17 @@ with operation_tab:
                             "trade_shares",
                             "trade_value",
                             "current_shares",
+                            "sellable_shares",
+                            "trading_status",
+                            "t1_locked",
                             "target_position_pct",
                             "expected_profit_amount",
                             "max_risk_amount",
                             "probability_up",
                             "risk_pct",
                             "latest",
+                            "limit_up",
+                            "limit_down",
                             "stop_loss",
                             "take_profit",
                             "reason",
@@ -726,6 +792,9 @@ with operation_tab:
                         "probability_up",
                         "confidence",
                         "latest",
+                        "trading_status",
+                        "limit_up",
+                        "limit_down",
                         "stop_loss",
                         "take_profit",
                         "suggested_position",
@@ -881,18 +950,22 @@ with pick_tab:
             elif realtime_picks.empty:
                 st.warning("当前参数下没有盘中实时候选股票。可以放宽盘中成交额、涨幅或均线条件。")
             else:
+                neutral_picks = add_group_neutral_rank(realtime_picks, factor_snapshot, max_per_group, top_n)
+                show_picks = neutral_picks if not neutral_picks.empty else realtime_picks
                 st.dataframe(
                     table_view(
-                        realtime_picks,
+                        show_picks,
                         [
-                            "rank",
+                            "neutral_rank" if "neutral_rank" in show_picks else "rank",
                             "code",
                             "name",
+                            "risk_group",
                             "latest",
                             "pct_change_rt",
                             "amount_rt",
                             "amount_ratio",
                             "momentum",
+                            "factor_score",
                             "distance_to_ma_short",
                             "score",
                             "quote_time",
@@ -911,14 +984,18 @@ with pick_tab:
             st.warning("当前参数下没有日线候选股票。")
         else:
             st.caption(f"日线交易日：{trade_date.date()}。日线选股基于本地日线缓存，只有点击“更新样本日线”后才会变。")
+            neutral_picks = add_group_neutral_rank(picks, factor_snapshot, max_per_group, top_n)
+            show_picks = neutral_picks if not neutral_picks.empty else picks
             display = table_view(
-                picks,
+                show_picks,
                 [
-                    "rank",
+                    "neutral_rank" if "neutral_rank" in show_picks else "rank",
                     "code",
                     "name",
+                    "risk_group",
                     "close",
                     "momentum",
+                    "factor_score",
                     "avg_amount_20",
                     "ma_short",
                     "ma_long",
@@ -926,6 +1003,129 @@ with pick_tab:
                 ],
             )
             st.dataframe(display, width="stretch", hide_index=True)
+
+with risk_tab:
+    if factor_snapshot.empty:
+        st.warning("暂无风控数据。请先更新样本日线。")
+    else:
+        st.subheader("股票池因子")
+        factor_cols = st.columns(4)
+        factor_cols[0].metric("覆盖股票", f"{len(factor_snapshot)}")
+        factor_cols[1].metric("风险分组", f"{factor_snapshot['risk_group'].nunique() if 'risk_group' in factor_snapshot else 0}")
+        factor_cols[2].metric("平均20日波动", pct(factor_snapshot["volatility_20"].mean() if "volatility_20" in factor_snapshot else None))
+        factor_cols[3].metric("平均60日回撤", pct(factor_snapshot["drawdown_60"].mean() if "drawdown_60" in factor_snapshot else None))
+
+        factor_view = factor_snapshot.sort_values("factor_score", ascending=False).head(top_n).copy()
+        st.dataframe(
+            table_view(
+                factor_view,
+                [
+                    "code",
+                    "name",
+                    "risk_group",
+                    "close",
+                    "momentum",
+                    "trend_strength",
+                    "avg_amount_20",
+                    "volatility_20",
+                    "drawdown_60",
+                    "pb",
+                    "factor_score",
+                ],
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+        latest_positions = holdings[holdings["date"] == holdings["date"].max()] if not holdings.empty else pd.DataFrame()
+        if latest_positions.empty:
+            st.info("暂无回测最新持仓，无法计算组合暴露。更新样本日线并跑出回测后会显示。")
+        else:
+            st.subheader("组合分组暴露")
+            group_view = group_exposure(latest_positions, factor_snapshot)
+            st.dataframe(
+                table_view(
+                    group_view,
+                    ["risk_group", "position_weight", "position_count", "universe_weight", "universe_count", "active_weight"],
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+            st.subheader("组合因子暴露")
+            exposure_view = factor_exposure(latest_positions, factor_snapshot)
+            st.dataframe(
+                table_view(exposure_view, ["factor", "portfolio_value", "universe_value", "active_value", "interpretation"]),
+                width="stretch",
+                hide_index=True,
+            )
+
+        st.caption("当前如果没有行业字段，会先按主板/创业板/科创板等市场分组；后续接入 Tushare 后可替换为申万行业。")
+
+with scan_tab:
+    if scan_grid_size == "关闭":
+        st.info("参数扫描已关闭。可在左侧“风控”里改为小或中。")
+    elif not bars_by_code:
+        st.warning("暂无日线缓存，无法做参数扫描。")
+    else:
+        if scan_grid_size == "小":
+            short_values = sorted({max(5, ma_short - 5), ma_short, min(60, ma_short + 5)})
+            long_values = sorted({max(30, ma_long - 20), ma_long, min(180, ma_long + 20)})
+            momentum_values = sorted({max(5, momentum_window - 10), momentum_window, min(120, momentum_window + 10)})
+            top_values = sorted({max(3, top_n - 5), top_n})
+        else:
+            short_values = sorted({10, 15, 20, 30, ma_short})
+            long_values = sorted({50, 60, 90, 120, ma_long})
+            momentum_values = sorted({10, 20, 40, 60, momentum_window})
+            top_values = sorted({10, 20, 30, top_n})
+
+        st.caption(
+            f"扫描组合数约 {len(short_values) * len(long_values) * len(momentum_values) * len(top_values)}，"
+            "仅用于检查参数稳定性，不用于过度拟合。"
+        )
+        if st.button("运行参数扫描", type="primary", width="stretch"):
+            with st.spinner("正在扫描参数"):
+                scan_result = run_parameter_scan(
+                    bars_by_code,
+                    stock_list,
+                    ma_short_values=short_values,
+                    ma_long_values=long_values,
+                    momentum_windows=momentum_values,
+                    top_n_values=top_values,
+                    min_avg_amount=min_avg_amount,
+                    min_listed_days=min_listed_days,
+                    cost_bps=cost_bps,
+                )
+            if scan_result.empty:
+                st.warning("没有生成可用扫描结果。")
+            else:
+                best = scan_result.iloc[0]
+                metric_cols = st.columns(4)
+                metric_cols[0].metric("最佳夏普", "-" if pd.isna(best["sharpe"]) else f"{best['sharpe']:.2f}")
+                metric_cols[1].metric("最佳年化", pct(best["annual_return"]))
+                metric_cols[2].metric("最大回撤", pct(best["max_drawdown"]))
+                metric_cols[3].metric("组合数", f"{len(scan_result)}")
+                st.dataframe(
+                    table_view(
+                        scan_result.head(30),
+                        [
+                            "ma_short_param",
+                            "ma_long_param",
+                            "momentum_window_param",
+                            "top_n_param",
+                            "trading_days",
+                            "total_return",
+                            "annual_return",
+                            "annual_volatility",
+                            "sharpe",
+                            "max_drawdown",
+                            "win_rate",
+                            "avg_turnover",
+                        ],
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
 
 with detail_tab:
     if panel.empty:

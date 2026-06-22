@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +11,7 @@ from typing import Callable, Iterable
 
 import pandas as pd
 import requests
+import streamlit as st
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "data"
@@ -81,6 +83,16 @@ SINA_INDEX_SYMBOLS = {
 
 class DataFetchError(RuntimeError):
     """Raised when a remote market-data request fails."""
+
+
+def _secret_value(name: str) -> str | None:
+    value = os.getenv(name)
+    if value:
+        return value
+    try:
+        return st.secrets.get(name)  # type: ignore[no-any-return]
+    except Exception:
+        return None
 
 
 def ensure_data_dirs() -> None:
@@ -252,9 +264,53 @@ def _fetch_stock_list_sina(max_pages: int = 10, page_size: int = 100) -> pd.Data
 
 def fetch_stock_list() -> pd.DataFrame:
     try:
-        return _fetch_stock_list_eastmoney()
+        df = _fetch_stock_list_eastmoney()
     except Exception:
-        return _fetch_stock_list_sina()
+        df = _fetch_stock_list_sina()
+
+    tushare_token = _secret_value("TUSHARE_TOKEN")
+    if tushare_token:
+        try:
+            return _merge_tushare_metadata(df, tushare_token)
+        except Exception:
+            pass
+    return df
+
+
+def _fetch_tushare_metadata(token: str) -> pd.DataFrame:
+    try:
+        import tushare as ts
+    except Exception as exc:  # noqa: BLE001 - optional provider.
+        raise DataFetchError("Tushare package is not installed") from exc
+
+    pro = ts.pro_api(token)
+    basic = pro.stock_basic(
+        exchange="",
+        list_status="L",
+        fields="ts_code,symbol,name,area,industry,list_date,market",
+    )
+    if basic.empty:
+        raise DataFetchError("No stock list rows returned from Tushare")
+
+    df = basic.rename(columns={"symbol": "code", "market": "tushare_market"})
+    df["code"] = df["code"].map(normalize_code)
+    df["list_date_ts"] = pd.to_datetime(df["list_date"], format="%Y%m%d", errors="coerce")
+    return df[["code", "area", "industry", "tushare_market", "list_date_ts"]]
+
+
+def _merge_tushare_metadata(stock_list: pd.DataFrame, token: str) -> pd.DataFrame:
+    meta = _fetch_tushare_metadata(token)
+    if meta.empty:
+        return stock_list
+    df = stock_list.copy()
+    df["code"] = df["code"].map(normalize_code)
+    df = df.merge(meta, on="code", how="left")
+    if "list_date_ts" in df:
+        df["list_date"] = df["list_date"].fillna(df["list_date_ts"])
+        df = df.drop(columns=["list_date_ts"])
+    df["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df.to_csv(STOCK_LIST_PATH, index=False)
+    return df
 
 
 def load_stock_list(refresh: bool = False) -> pd.DataFrame:

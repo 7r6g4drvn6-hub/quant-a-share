@@ -7,6 +7,68 @@ def _clip(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+def _limit_pct_for_stock(code: str | int, name: str | None = None) -> float:
+    text = str(code).zfill(6)
+    stock_name = name or ""
+    if "ST" in stock_name.upper() or "退" in stock_name:
+        return 0.05
+    if text.startswith(("300", "301", "688", "689")):
+        return 0.20
+    if text.startswith(("8", "4", "92")):
+        return 0.30
+    return 0.10
+
+
+def trading_constraints(row: pd.Series) -> dict[str, object]:
+    code = row.get("code", "")
+    name = row.get("name", "")
+    latest = row.get("latest_rt", row.get("latest", row.get("close", pd.NA)))
+    prev_close = row.get("prev_close_rt", row.get("prev_close", pd.NA))
+    volume = row.get("volume_rt", row.get("volume", pd.NA))
+    amount = row.get("amount_rt", row.get("amount", pd.NA))
+
+    limit_pct = _limit_pct_for_stock(code, name)
+    limit_up = pd.NA
+    limit_down = pd.NA
+    is_limit_up = False
+    is_limit_down = False
+    is_suspended = False
+
+    if pd.notna(prev_close) and float(prev_close) > 0:
+        limit_up = round(float(prev_close) * (1 + limit_pct), 2)
+        limit_down = round(float(prev_close) * (1 - limit_pct), 2)
+        if pd.notna(latest) and float(latest) > 0:
+            tolerance = max(float(prev_close) * 0.0015, 0.01)
+            is_limit_up = float(latest) >= float(limit_up) - tolerance
+            is_limit_down = float(latest) <= float(limit_down) + tolerance
+
+    if pd.notna(latest) and float(latest) <= 0:
+        is_suspended = True
+    if pd.notna(volume) and float(volume) <= 0 and pd.notna(amount) and float(amount) <= 0:
+        is_suspended = True
+
+    if is_suspended:
+        trading_status = "停牌/无成交"
+    elif is_limit_up:
+        trading_status = "涨停"
+    elif is_limit_down:
+        trading_status = "跌停"
+    else:
+        trading_status = "正常交易"
+
+    return {
+        "limit_pct": limit_pct,
+        "limit_up": limit_up,
+        "limit_down": limit_down,
+        "is_limit_up": bool(is_limit_up),
+        "is_limit_down": bool(is_limit_down),
+        "is_suspended": bool(is_suspended),
+        "can_buy": not (is_suspended or is_limit_up),
+        "can_sell": not (is_suspended or is_limit_down),
+        "trading_status": trading_status,
+    }
+
+
 def _allocate_with_caps(scores: pd.Series, budget: float, caps: pd.Series) -> pd.Series:
     allocations = pd.Series(0.0, index=scores.index)
     remaining = max(float(budget), 0.0)
@@ -546,12 +608,14 @@ def operation_recommendations(
 
     quotes = pd.DataFrame()
     if realtime_quotes is not None and not realtime_quotes.empty:
-        quote_cols = ["code", "latest", "amount", "pct_change", "high", "low", "quote_time"]
+        quote_cols = ["code", "latest", "prev_close", "volume", "amount", "pct_change", "high", "low", "quote_time"]
         quotes = realtime_quotes[[col for col in quote_cols if col in realtime_quotes]].copy()
         quotes["code"] = quotes["code"].astype(str).str.zfill(6)
         quotes = quotes.rename(
             columns={
                 "latest": "latest_rt",
+                "prev_close": "prev_close_rt",
+                "volume": "volume_rt",
                 "amount": "amount_rt",
                 "pct_change": "pct_change_rt",
                 "high": "high_rt",
@@ -613,6 +677,7 @@ def operation_recommendations(
         take_profit = latest_price * (1 + risk_pct * reward_risk)
         gain_pct = (take_profit - latest_price) / latest_price
         expected_value = probability * gain_pct - (1 - probability) * risk_pct
+        constraints = trading_constraints(row)
 
         buy_score = 0.0
         sell_score = 0.0
@@ -656,6 +721,16 @@ def operation_recommendations(
             buy_score += min(expected_value * 10, 0.12)
         else:
             sell_score += min(abs(expected_value) * 10, 0.12)
+        if constraints["is_limit_up"]:
+            buy_score -= 0.35
+            reasons.append("涨停不追买")
+        if constraints["is_limit_down"]:
+            sell_score += 0.10
+            reasons.append("跌停流动性受限")
+        if constraints["is_suspended"]:
+            buy_score = 0.0
+            sell_score = 0.0
+            reasons.append("停牌或无成交")
 
         if sell_score >= 0.50:
             action = "卖出/回避"
@@ -694,6 +769,12 @@ def operation_recommendations(
                 "amount_ratio_rt": amount_ratio,
                 "momentum": momentum,
                 "distance_to_ma_short": distance_to_ma_short,
+                "limit_up": constraints["limit_up"],
+                "limit_down": constraints["limit_down"],
+                "limit_pct": constraints["limit_pct"],
+                "trading_status": constraints["trading_status"],
+                "can_buy": constraints["can_buy"],
+                "can_sell": constraints["can_sell"],
                 "quote_time": row.get("quote_time", pd.NA),
                 "reason": "、".join(dict.fromkeys(reasons[:5])),
             }
@@ -721,6 +802,7 @@ def optimize_trade_plan(
     max_position_pct: float,
     max_buy_candidates: int,
     lot_size: int = 100,
+    trade_date=None,
 ) -> pd.DataFrame:
     columns = [
         "rank",
@@ -772,21 +854,48 @@ def optimize_trade_plan(
         holding_frame = holdings.copy()
         if "cost_price" not in holding_frame:
             holding_frame["cost_price"] = pd.NA
+        if "buy_date" not in holding_frame:
+            holding_frame["buy_date"] = pd.NaT
         holding_frame["code"] = holding_frame["code"].astype(str).str.zfill(6)
         holding_frame["shares"] = pd.to_numeric(holding_frame["shares"], errors="coerce").fillna(0.0)
         holding_frame["cost_price"] = pd.to_numeric(holding_frame["cost_price"], errors="coerce")
+        holding_frame["buy_date"] = pd.to_datetime(holding_frame["buy_date"], errors="coerce")
         holding_frame = holding_frame[holding_frame["shares"] > 0].copy()
         holding_frame["position_cost"] = holding_frame["shares"] * holding_frame["cost_price"].fillna(0.0)
+        holding_frame["latest_buy_date"] = holding_frame["buy_date"]
         holding_frame = (
             holding_frame.groupby("code", as_index=False)
-            .agg(shares=("shares", "sum"), position_cost=("position_cost", "sum"))
+            .agg(
+                shares=("shares", "sum"),
+                position_cost=("position_cost", "sum"),
+                latest_buy_date=("latest_buy_date", "max"),
+            )
             .reset_index(drop=True)
         )
         holding_frame["cost_price"] = holding_frame["position_cost"] / holding_frame["shares"]
+        today = pd.Timestamp.today().normalize() if trade_date is None else pd.to_datetime(trade_date).normalize()
+        holding_frame["t1_locked"] = holding_frame["latest_buy_date"].dt.normalize().eq(today)
+        holding_frame["sellable_shares"] = holding_frame["shares"].where(~holding_frame["t1_locked"], 0.0)
+    else:
+        holding_frame["latest_buy_date"] = pd.NaT
+        holding_frame["t1_locked"] = False
+        holding_frame["sellable_shares"] = 0.0
 
-    ops = ops.merge(holding_frame[["code", "shares", "cost_price"]], on="code", how="left")
+    ops = ops.merge(
+        holding_frame[["code", "shares", "cost_price", "latest_buy_date", "t1_locked", "sellable_shares"]],
+        on="code",
+        how="left",
+    )
     ops["current_shares"] = pd.to_numeric(ops["shares"], errors="coerce").fillna(0.0)
+    ops["sellable_shares"] = pd.to_numeric(ops["sellable_shares"], errors="coerce").fillna(ops["current_shares"])
+    ops["t1_locked"] = ops["t1_locked"].where(ops["t1_locked"].notna(), False).astype(bool)
     ops["current_value"] = ops["current_shares"] * ops["latest"].fillna(0.0)
+    for column, default in [("can_buy", True), ("can_sell", True)]:
+        if column not in ops:
+            ops[column] = default
+        ops[column] = ops[column].fillna(default).astype(bool)
+    if "trading_status" not in ops:
+        ops["trading_status"] = "未知"
 
     total_assets = max(float(total_assets or 0.0), 0.0)
     cash_available = max(float(cash_available or 0.0), 0.0)
@@ -811,6 +920,8 @@ def optimize_trade_plan(
 
     sell_mask = (
         (ops["current_shares"] > 0)
+        & (ops["sellable_shares"] > 0)
+        & ops["can_sell"]
         & (
             ops["action"].eq("卖出/回避")
             | (ops["expected_value"] < -0.005)
@@ -835,6 +946,7 @@ def optimize_trade_plan(
         & (ops["probability_up"] >= 0.55)
         & ops["latest"].notna()
         & (ops["latest"] > 0)
+        & ops["can_buy"]
     )
     buy_universe = ops[buy_mask].sort_values("optimizer_score", ascending=False).head(max_buy_candidates)
     buy_increments = pd.Series(0.0, index=ops.index)
@@ -864,17 +976,27 @@ def optimize_trade_plan(
             trade_shares = int(raw_trade_shares // lot_size * lot_size)
         elif raw_trade_shares < 0:
             if target_value <= 0:
-                trade_shares = -int(current_shares)
+                trade_shares = -int(row.get("sellable_shares", current_shares))
             else:
                 sell_lots = int(abs(raw_trade_shares) // lot_size * lot_size)
-                trade_shares = -min(sell_lots, int(current_shares))
+                trade_shares = -min(sell_lots, int(row.get("sellable_shares", current_shares)))
         else:
+            trade_shares = 0
+        if trade_shares > 0 and not bool(row.get("can_buy", True)):
+            trade_shares = 0
+        if trade_shares < 0 and (not bool(row.get("can_sell", True)) or bool(row.get("t1_locked", False))):
             trade_shares = 0
 
         trade_value = trade_shares * float(latest_price)
         target_value_after_lot = max(current_value + trade_value, 0.0)
 
-        if trade_shares > 0:
+        if bool(row.get("t1_locked", False)) and current_shares > 0:
+            recommendation = "T+1锁定"
+        elif not bool(row.get("can_buy", True)) and current_shares <= 0:
+            recommendation = "不可买"
+        elif not bool(row.get("can_sell", True)) and current_shares > 0 and row["action"] == "卖出/回避":
+            recommendation = "无法卖出"
+        elif trade_shares > 0:
             recommendation = "买入"
         elif trade_shares < 0:
             recommendation = "卖出"
@@ -908,6 +1030,11 @@ def optimize_trade_plan(
                 "latest": float(latest_price),
                 "stop_loss": row.get("stop_loss", pd.NA),
                 "take_profit": row.get("take_profit", pd.NA),
+                "trading_status": row.get("trading_status", "未知"),
+                "t1_locked": bool(row.get("t1_locked", False)),
+                "sellable_shares": float(row.get("sellable_shares", current_shares)),
+                "limit_up": row.get("limit_up", pd.NA),
+                "limit_down": row.get("limit_down", pd.NA),
                 "reason": row.get("reason", ""),
             }
         )
@@ -935,6 +1062,11 @@ def optimize_trade_plan(
                 "latest": pd.NA,
                 "stop_loss": pd.NA,
                 "take_profit": pd.NA,
+                "trading_status": "不在股票池",
+                "t1_locked": bool(holding.get("t1_locked", False)),
+                "sellable_shares": float(holding.get("sellable_shares", 0.0)),
+                "limit_up": pd.NA,
+                "limit_down": pd.NA,
                 "reason": "该持仓不在当前股票池或操作结果中",
             }
         )
@@ -943,7 +1075,18 @@ def optimize_trade_plan(
         return pd.DataFrame(columns=columns)
 
     result = pd.DataFrame(rows)
-    priority = {"买入": 0, "卖出": 1, "持有/可加仓": 2, "持有观察": 3, "观望": 4, "回避": 5, "无法定价": 6}
+    priority = {
+        "买入": 0,
+        "卖出": 1,
+        "T+1锁定": 2,
+        "无法卖出": 3,
+        "持有/可加仓": 4,
+        "持有观察": 5,
+        "观望": 6,
+        "不可买": 7,
+        "回避": 8,
+        "无法定价": 9,
+    }
     result["priority"] = result["recommendation"].map(priority).fillna(9)
     result = result.sort_values(
         ["priority", "expected_profit_amount", "probability_up"],
@@ -951,4 +1094,5 @@ def optimize_trade_plan(
         na_position="last",
     ).reset_index(drop=True)
     result["rank"] = range(1, len(result) + 1)
-    return result[columns]
+    extra_columns = ["trading_status", "t1_locked", "sellable_shares", "limit_up", "limit_down"]
+    return result[columns + [column for column in extra_columns if column in result]]
