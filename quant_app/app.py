@@ -278,8 +278,8 @@ def parse_holdings_text(text: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
-def cached_stock_list(refresh: bool = False) -> pd.DataFrame:
-    return load_stock_list(refresh=refresh)
+def cached_stock_list(refresh: bool = False, min_rows: int = 1000) -> pd.DataFrame:
+    return load_stock_list(refresh=refresh, min_rows=min_rows)
 
 
 @st.cache_data(ttl=5)
@@ -403,9 +403,18 @@ default_start_date = parse_date_default(
 )
 if default_start_date > default_end_date:
     default_start_date = default_end_date - timedelta(days=730)
-default_stock_count = clamp_int(sample_defaults.get("stock_count"), 20, 1000, 100)
-default_stock_count = int(round(default_stock_count / 20) * 20)
-default_stock_count = clamp_int(default_stock_count, 20, 1000, 100)
+max_stock_count = 5000
+stored_stock_count = sample_defaults.get("stock_count")
+if stored_stock_count is not None:
+    try:
+        stored_stock_count = int(stored_stock_count)
+    except (TypeError, ValueError):
+        stored_stock_count = None
+if stored_stock_count is not None and stored_stock_count < 1000:
+    stored_stock_count = 1000
+default_stock_count = clamp_int(stored_stock_count, 20, max_stock_count, 1000)
+default_stock_count = int(round(default_stock_count / 50) * 50)
+default_stock_count = clamp_int(default_stock_count, 20, max_stock_count, 1000)
 default_auto_fetch_missing = bool(sample_defaults.get("auto_fetch_missing", False))
 
 with st.sidebar:
@@ -415,9 +424,9 @@ with st.sidebar:
     stock_count = st.slider(
         "股票数量",
         min_value=20,
-        max_value=1000,
+        max_value=max_stock_count,
         value=default_stock_count,
-        step=20,
+        step=50,
         key="sample_stock_count",
     )
     auto_fetch_missing = st.toggle(
@@ -468,7 +477,7 @@ if ma_short >= ma_long:
     st.stop()
 
 try:
-    stock_list = cached_stock_list(refresh=refresh_list)
+    stock_list = cached_stock_list(refresh=refresh_list, min_rows=min(stock_count, 1000))
 except Exception as exc:  # noqa: BLE001 - show data-source failures in app.
     st.error(f"股票列表加载失败：{exc}")
     st.stop()
@@ -495,12 +504,18 @@ if update_prices:
         st.success("样本日线已更新。")
 
 bars_by_code, missing_codes = load_cached_bars_for_codes(selected_codes, start_date, end_date)
-if missing_codes and auto_fetch_missing:
+auto_fetch_limit = 200
+if missing_codes and auto_fetch_missing and len(missing_codes) <= auto_fetch_limit:
     with st.spinner(f"补齐 {len(missing_codes)} 只股票的日线"):
         fetched, fetch_errors = update_daily_cache(missing_codes, start_date, end_date)
     bars_by_code.update(fetched)
     if fetch_errors:
         st.warning(f"{len(fetch_errors)} 只股票无法获取。")
+elif missing_codes and auto_fetch_missing:
+    st.info(
+        f"有 {len(missing_codes)} 只股票缺少日线缓存，数量较大，已跳过自动补齐以避免页面卡住。"
+        "实时行情仍会覆盖全部样本；回测、日线选股和个股预测需要点击“更新样本日线”补齐。"
+    )
 elif missing_codes:
     st.info(f"有 {len(missing_codes)} 只股票缺少日线缓存。实时行情仍会覆盖全部样本；回测、日线选股和个股预测需要点击“更新样本日线”补齐。")
 
@@ -531,7 +546,7 @@ realtime_run_every = refresh_seconds if realtime_auto_refresh else None
 
 with market_tab:
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("股票池", f"{len(selected_codes)}")
+    col1.metric("样本/股票池", f"{len(selected_codes)}/{len(stock_list)}")
     col2.metric("缓存可用", f"{len(bars_by_code)}")
     col3.metric("回测交易日", f"{len(equity)}")
     col4.metric("最新列表", str(stock_list["updated_at"].iloc[0]) if "updated_at" in stock_list else "-")

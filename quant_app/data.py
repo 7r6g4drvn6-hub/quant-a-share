@@ -18,6 +18,7 @@ DATA_DIR = ROOT_DIR / "data"
 DAILY_DIR = DATA_DIR / "daily"
 INDEX_DIR = DATA_DIR / "index"
 STOCK_LIST_PATH = DATA_DIR / "stock_list.csv"
+DEFAULT_MIN_STOCK_LIST_ROWS = 1000
 
 EASTMONEY_CLIST_URL = "https://push2.eastmoney.com/api/qt/clist/get"
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -210,7 +211,7 @@ def _fetch_stock_list_eastmoney() -> pd.DataFrame:
     return df
 
 
-def _fetch_stock_list_sina(max_pages: int = 10, page_size: int = 100) -> pd.DataFrame:
+def _fetch_stock_list_sina(max_pages: int = 60, page_size: int = 100) -> pd.DataFrame:
     ensure_data_dirs()
     rows = []
     for page in range(1, max_pages + 1):
@@ -262,11 +263,15 @@ def _fetch_stock_list_sina(max_pages: int = 10, page_size: int = 100) -> pd.Data
     return df
 
 
-def fetch_stock_list() -> pd.DataFrame:
+def fetch_stock_list(min_rows: int = DEFAULT_MIN_STOCK_LIST_ROWS) -> pd.DataFrame:
+    min_rows = max(int(min_rows or DEFAULT_MIN_STOCK_LIST_ROWS), 1)
     try:
         df = _fetch_stock_list_eastmoney()
+        if len(df) < min_rows:
+            raise DataFetchError(f"Eastmoney stock list too small: {len(df)} rows")
     except Exception:
-        df = _fetch_stock_list_sina()
+        sina_pages = max(10, min(80, (min_rows + 99) // 100 + 5))
+        df = _fetch_stock_list_sina(max_pages=sina_pages)
 
     tushare_token = _secret_value("TUSHARE_TOKEN")
     if tushare_token:
@@ -313,11 +318,17 @@ def _merge_tushare_metadata(stock_list: pd.DataFrame, token: str) -> pd.DataFram
     return df
 
 
-def load_stock_list(refresh: bool = False) -> pd.DataFrame:
+def load_stock_list(refresh: bool = False, min_rows: int = DEFAULT_MIN_STOCK_LIST_ROWS) -> pd.DataFrame:
     ensure_data_dirs()
     if refresh or not STOCK_LIST_PATH.exists():
-        return fetch_stock_list()
-    return pd.read_csv(STOCK_LIST_PATH, dtype={"code": str}, parse_dates=["list_date"])
+        return fetch_stock_list(min_rows=min_rows)
+    cached = pd.read_csv(STOCK_LIST_PATH, dtype={"code": str}, parse_dates=["list_date"])
+    if len(cached) < max(int(min_rows or DEFAULT_MIN_STOCK_LIST_ROWS), 1):
+        try:
+            return fetch_stock_list(min_rows=min_rows)
+        except Exception:
+            return cached
+    return cached
 
 
 def fetch_realtime_quotes(codes: Iterable[str], batch_size: int = 80) -> pd.DataFrame:
