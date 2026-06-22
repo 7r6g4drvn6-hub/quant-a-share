@@ -19,6 +19,15 @@ FACTOR_LABELS = {
 }
 
 
+BOARD_STATUS_ORDER = {
+    "强势领涨": 0,
+    "板块活跃": 1,
+    "资金分化": 2,
+    "板块承压": 3,
+    "普跌弱势": 4,
+}
+
+
 def market_segment(code: str | int) -> str:
     text = str(code).zfill(6)
     if text.startswith(("600", "601", "603", "605")):
@@ -43,6 +52,19 @@ def preferred_group_column(stock_list: pd.DataFrame) -> str:
         if column in stock_list and stock_list[column].notna().any():
             return column
     return "risk_group"
+
+
+def stock_group_map(stock_list: pd.DataFrame) -> pd.DataFrame:
+    if stock_list.empty:
+        return pd.DataFrame(columns=["code", "risk_group"])
+
+    frame = stock_list.copy()
+    frame["code"] = frame["code"].astype(str).str.zfill(6)
+    frame["risk_group"] = frame["code"].map(market_segment)
+    group_column = preferred_group_column(frame)
+    if group_column != "risk_group":
+        frame["risk_group"] = frame[group_column].fillna(frame["risk_group"])
+    return frame[["code", "risk_group"]].drop_duplicates("code")
 
 
 def _rank_pct(series: pd.Series, ascending: bool = True) -> pd.Series:
@@ -85,10 +107,9 @@ def build_factor_snapshot(panel: pd.DataFrame, stock_list: pd.DataFrame) -> pd.D
     latest = latest.drop(columns=[column for column in info.columns if column in latest.columns and column != "code"], errors="ignore")
     latest = latest.merge(info, on="code", how="left")
 
-    latest["risk_group"] = latest["code"].map(market_segment)
-    group_column = preferred_group_column(latest)
-    if group_column != "risk_group":
-        latest["risk_group"] = latest[group_column].fillna(latest["risk_group"])
+    latest = latest.drop(columns=["risk_group"], errors="ignore")
+    latest = latest.merge(stock_group_map(latest), on="code", how="left")
+    latest["risk_group"] = latest["risk_group"].fillna(latest["code"].map(market_segment))
 
     latest["trend_strength"] = latest["close"] / latest["ma_long"] - 1
     latest["liquidity_score"] = _rank_pct(latest["avg_amount_20"], ascending=True)
@@ -188,6 +209,144 @@ def factor_exposure(positions: pd.DataFrame, factor_snapshot: pd.DataFrame) -> p
             }
         )
     return pd.DataFrame(rows)
+
+
+def _board_status(weighted_pct_change: float, up_ratio: float) -> str:
+    if weighted_pct_change >= 1.5 and up_ratio >= 0.65:
+        return "强势领涨"
+    if weighted_pct_change >= 0.5 and up_ratio >= 0.55:
+        return "板块活跃"
+    if weighted_pct_change <= -1.5 and up_ratio <= 0.35:
+        return "普跌弱势"
+    if weighted_pct_change <= -0.5 and up_ratio <= 0.45:
+        return "板块承压"
+    return "资金分化"
+
+
+def board_market_judgment(
+    realtime_quotes: pd.DataFrame,
+    stock_list: pd.DataFrame,
+    min_members: int = 5,
+) -> tuple[dict[str, object], pd.DataFrame]:
+    if realtime_quotes.empty or stock_list.empty:
+        return {}, pd.DataFrame()
+
+    quote_cols = ["code", "name", "latest", "pct_change", "amount", "quote_time", "quote_datetime"]
+    quotes = realtime_quotes[[column for column in quote_cols if column in realtime_quotes]].copy()
+    quotes["code"] = quotes["code"].astype(str).str.zfill(6)
+    quotes["pct_change"] = pd.to_numeric(quotes.get("pct_change"), errors="coerce")
+    quotes["amount"] = pd.to_numeric(quotes.get("amount"), errors="coerce").fillna(0.0)
+    quotes = quotes[quotes["pct_change"].notna()].copy()
+    if quotes.empty:
+        return {}, pd.DataFrame()
+
+    grouped_quotes = quotes.merge(stock_group_map(stock_list), on="code", how="left")
+    grouped_quotes["risk_group"] = grouped_quotes["risk_group"].fillna(grouped_quotes["code"].map(market_segment))
+    total_amount = grouped_quotes["amount"].sum()
+    total_amount = total_amount if total_amount > 0 else 1.0
+
+    rows = []
+    for board_name, group in grouped_quotes.groupby("risk_group", dropna=False):
+        quote_count = len(group)
+        if quote_count < min_members:
+            continue
+
+        amount = float(group["amount"].sum())
+        avg_pct_change = float(group["pct_change"].mean())
+        median_pct_change = float(group["pct_change"].median())
+        weighted_pct_change = (
+            float((group["pct_change"] * group["amount"]).sum() / amount)
+            if amount > 0
+            else avg_pct_change
+        )
+        up_count = int((group["pct_change"] > 0).sum())
+        down_count = int((group["pct_change"] < 0).sum())
+        flat_count = int((group["pct_change"] == 0).sum())
+        up_ratio = up_count / quote_count if quote_count else 0.0
+        strong_count = int((group["pct_change"] >= 5.0).sum())
+        limit_up_count = int((group["pct_change"] >= 9.7).sum())
+        limit_down_count = int((group["pct_change"] <= -9.7).sum())
+        leader = group.sort_values(["pct_change", "amount"], ascending=False).iloc[0]
+        laggard = group.sort_values(["pct_change", "amount"], ascending=[True, False]).iloc[0]
+        board_score = weighted_pct_change * 0.45 + (up_ratio - 0.5) * 6.0 + min(amount / total_amount, 0.2) * 4.0
+
+        rows.append(
+            {
+                "board_name": str(board_name),
+                "market_status": _board_status(weighted_pct_change, up_ratio),
+                "board_score": board_score,
+                "quote_count": quote_count,
+                "up_count": up_count,
+                "down_count": down_count,
+                "flat_count": flat_count,
+                "up_ratio": up_ratio,
+                "avg_pct_change": avg_pct_change,
+                "median_pct_change": median_pct_change,
+                "weighted_pct_change": weighted_pct_change,
+                "amount": amount,
+                "amount_yi": amount / 100000000,
+                "amount_share": amount / total_amount,
+                "strong_count": strong_count,
+                "limit_up_count": limit_up_count,
+                "limit_down_count": limit_down_count,
+                "leader_code": leader.get("code", ""),
+                "leader_name": leader.get("name", ""),
+                "leader_pct_change": leader.get("pct_change", pd.NA),
+                "laggard_code": laggard.get("code", ""),
+                "laggard_name": laggard.get("name", ""),
+                "laggard_pct_change": laggard.get("pct_change", pd.NA),
+                "quote_time": group["quote_time"].dropna().max() if "quote_time" in group else pd.NA,
+            }
+        )
+
+    if not rows:
+        return {}, pd.DataFrame()
+
+    boards = pd.DataFrame(rows)
+    boards["status_order"] = boards["market_status"].map(BOARD_STATUS_ORDER).fillna(9)
+    boards = boards.sort_values(
+        ["status_order", "board_score", "weighted_pct_change", "amount"],
+        ascending=[True, False, False, False],
+    ).drop(columns=["status_order"]).reset_index(drop=True)
+    boards["rank"] = range(1, len(boards) + 1)
+
+    overall_amount = float(grouped_quotes["amount"].sum())
+    overall_weighted = (
+        float((grouped_quotes["pct_change"] * grouped_quotes["amount"]).sum() / overall_amount)
+        if overall_amount > 0
+        else float(grouped_quotes["pct_change"].mean())
+    )
+    overall_up_ratio = float((grouped_quotes["pct_change"] > 0).mean())
+    strong_boards = int(boards["market_status"].isin(["强势领涨", "板块活跃"]).sum())
+    weak_boards = int(boards["market_status"].isin(["板块承压", "普跌弱势"]).sum())
+
+    if strong_boards >= max(2, len(boards) * 0.35) and overall_up_ratio >= 0.55:
+        market_view = "板块扩散偏强"
+    elif weak_boards >= max(2, len(boards) * 0.35) and overall_up_ratio <= 0.45:
+        market_view = "板块退潮偏弱"
+    elif strong_boards > 0 and weak_boards > 0:
+        market_view = "结构分化"
+    elif overall_weighted >= 0.3 and overall_up_ratio >= 0.5:
+        market_view = "温和修复"
+    elif overall_weighted <= -0.3 and overall_up_ratio <= 0.5:
+        market_view = "震荡承压"
+    else:
+        market_view = "中性震荡"
+
+    summary = {
+        "market_view": market_view,
+        "board_count": len(boards),
+        "strong_board_count": strong_boards,
+        "weak_board_count": weak_boards,
+        "overall_up_ratio": overall_up_ratio,
+        "overall_weighted_pct_change": overall_weighted,
+        "total_amount_yi": overall_amount / 100000000,
+        "leading_board": boards.iloc[0]["board_name"],
+        "leading_status": boards.iloc[0]["market_status"],
+        "leading_pct_change": boards.iloc[0]["weighted_pct_change"],
+        "weakest_board": boards.sort_values("weighted_pct_change").iloc[0]["board_name"],
+    }
+    return summary, boards
 
 
 def run_parameter_scan(
