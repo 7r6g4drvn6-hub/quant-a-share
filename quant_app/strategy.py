@@ -102,7 +102,10 @@ def add_indicators(
     ma_long: int = 60,
     momentum_window: int = 20,
 ) -> pd.DataFrame:
-    df = bars.sort_values("date").copy()
+    df = bars.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date")
+    df = df.drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
     df["ma_short"] = df["close"].rolling(ma_short).mean()
     df["ma_long"] = df["close"].rolling(ma_long).mean()
     df["momentum"] = df["close"] / df["close"].shift(momentum_window) - 1
@@ -130,9 +133,14 @@ def build_panel(
         return pd.DataFrame()
 
     panel = pd.concat(frames, ignore_index=True)
+    panel["date"] = pd.to_datetime(panel["date"], errors="coerce")
+    panel = panel.dropna(subset=["date"])
+    panel = panel.drop_duplicates(subset=["code", "date"], keep="last")
     info = stock_list[["code", "name", "list_date", "is_st"]].copy()
     info["code"] = info["code"].astype(str).str.zfill(6)
+    info = info.drop_duplicates(subset=["code"], keep="last")
     panel = panel.merge(info, on="code", how="left")
+    panel = panel.drop_duplicates(subset=["code", "date"], keep="last")
     panel["is_st"] = panel["is_st"].fillna(False)
     return panel
 

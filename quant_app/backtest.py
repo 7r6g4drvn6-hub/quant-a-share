@@ -8,6 +8,20 @@ import pandas as pd
 from quant_app.strategy import candidates_for_date
 
 
+def _daily_return_for_code(day: pd.DataFrame, code: str) -> float | None:
+    if code not in day.index:
+        return None
+    value = day.loc[code, "daily_return"]
+    if isinstance(value, pd.Series):
+        value = value.dropna()
+        if value.empty:
+            return None
+        value = value.iloc[-1]
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
 def _metrics(equity: pd.DataFrame) -> dict[str, float]:
     if equity.empty:
         return {}
@@ -42,7 +56,15 @@ def run_backtest(
     if panel.empty:
         return pd.DataFrame(), pd.DataFrame(), {}
 
-    dates = sorted(panel["date"].dropna().unique())
+    clean_panel = panel.copy()
+    clean_panel["date"] = pd.to_datetime(clean_panel["date"], errors="coerce")
+    clean_panel = clean_panel.dropna(subset=["date", "code"])
+    clean_panel["code"] = clean_panel["code"].astype(str).str.zfill(6)
+    clean_panel = clean_panel.drop_duplicates(subset=["code", "date"], keep="last")
+    if clean_panel.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+    dates = sorted(clean_panel["date"].dropna().unique())
     weights: dict[str, float] = {}
     equity_value = 1.0
     rows = []
@@ -50,16 +72,17 @@ def run_backtest(
     cost_rate = cost_bps / 10000
 
     for trade_date in dates:
-        day = panel[panel["date"] == trade_date].set_index("code")
+        day = clean_panel[clean_panel["date"] == trade_date].set_index("code")
         gross_return = 0.0
         for code, weight in list(weights.items()):
-            if code in day.index and pd.notna(day.loc[code, "daily_return"]):
-                gross_return += weight * float(day.loc[code, "daily_return"])
+            daily_return = _daily_return_for_code(day, code)
+            if daily_return is not None:
+                gross_return += weight * daily_return
 
         equity_value *= 1 + gross_return
 
         candidates = candidates_for_date(
-            panel,
+            clean_panel,
             trade_date,
             min_avg_amount=min_avg_amount,
             min_listed_days=min_listed_days,
@@ -119,4 +142,3 @@ def normalized_benchmark(index_bars: pd.DataFrame, dates: pd.Series) -> pd.DataF
         return pd.DataFrame(columns=["date", "benchmark"])
     df["benchmark"] = df["close"] / df["close"].iloc[0]
     return df[["date", "benchmark"]]
-
