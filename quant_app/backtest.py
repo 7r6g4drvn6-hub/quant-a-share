@@ -5,21 +5,35 @@ import math
 import numpy as np
 import pandas as pd
 
-from quant_app.strategy import candidates_for_date
+def _backtest_candidates(
+    panel: pd.DataFrame,
+    min_avg_amount: float,
+    min_listed_days: int,
+    top_n: int,
+) -> pd.DataFrame:
+    if panel.empty:
+        return pd.DataFrame()
 
+    if "list_date" in panel:
+        list_date = pd.to_datetime(panel["list_date"], errors="coerce")
+        listed_days = (panel["date"] - list_date).dt.days
+    else:
+        listed_days = panel["trading_days"]
 
-def _daily_return_for_code(day: pd.DataFrame, code: str) -> float | None:
-    if code not in day.index:
-        return None
-    value = day.loc[code, "daily_return"]
-    if isinstance(value, pd.Series):
-        value = value.dropna()
-        if value.empty:
-            return None
-        value = value.iloc[-1]
-    if pd.isna(value):
-        return None
-    return float(value)
+    mask = (
+        (~panel["is_st"].fillna(False))
+        & (panel["trading_days"] >= min_listed_days)
+        & (listed_days.fillna(min_listed_days) >= min_listed_days)
+        & (panel["avg_amount_20"] >= min_avg_amount)
+        & (panel["close"] > panel["ma_short"])
+        & (panel["ma_short"] > panel["ma_long"])
+        & panel["momentum"].notna()
+    )
+    candidates = panel[mask].sort_values(["date", "momentum"], ascending=[True, False]).copy()
+    if candidates.empty:
+        return candidates
+    candidates["rank"] = candidates.groupby("date").cumcount() + 1
+    return candidates[candidates["rank"] <= top_n].copy()
 
 
 def _metrics(equity: pd.DataFrame) -> dict[str, float]:
@@ -70,24 +84,25 @@ def run_backtest(
     rows = []
     holdings_rows = []
     cost_rate = cost_bps / 10000
+    returns_by_date = clean_panel.pivot(index="date", columns="code", values="daily_return")
+    candidate_panel = _backtest_candidates(clean_panel, min_avg_amount, min_listed_days, top_n)
+    candidate_groups = {
+        trade_date: group
+        for trade_date, group in candidate_panel.groupby("date", sort=False)
+    }
 
     for trade_date in dates:
-        day = clean_panel[clean_panel["date"] == trade_date].set_index("code")
         gross_return = 0.0
-        for code, weight in list(weights.items()):
-            daily_return = _daily_return_for_code(day, code)
-            if daily_return is not None:
-                gross_return += weight * daily_return
+        if weights and trade_date in returns_by_date.index:
+            daily_returns = returns_by_date.loc[trade_date]
+            for code, weight in weights.items():
+                daily_return = daily_returns.get(code)
+                if pd.notna(daily_return):
+                    gross_return += weight * float(daily_return)
 
         equity_value *= 1 + gross_return
 
-        candidates = candidates_for_date(
-            clean_panel,
-            trade_date,
-            min_avg_amount=min_avg_amount,
-            min_listed_days=min_listed_days,
-            top_n=top_n,
-        )
+        candidates = candidate_groups.get(trade_date, pd.DataFrame())
         target_codes = candidates["code"].tolist() if not candidates.empty else []
         target_weight = 1 / len(target_codes) if target_codes else 0
         target_weights = {code: target_weight for code in target_codes}

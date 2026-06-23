@@ -500,7 +500,7 @@ with st.sidebar:
     refresh_seconds = st.slider("刷新秒数", min_value=10, max_value=120, value=30, step=10)
     min_realtime_amount_yi = st.slider("盘中成交额下限", min_value=0.1, max_value=20.0, value=0.5, step=0.1)
     min_intraday_pct = st.slider("盘中涨幅下限", min_value=-5.0, max_value=10.0, value=0.0, step=0.5)
-    max_intraday_pct = st.slider("盘中涨幅上限", min_value=0.0, max_value=20.0, value=9.8, step=0.5)
+    max_intraday_pct = st.slider("盘中涨幅上限", min_value=0.0, max_value=20.0, value=10.0, step=0.5)
     refresh_realtime = st.button("刷新实时行情", width="stretch")
 
     st.subheader("预测")
