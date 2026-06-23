@@ -432,11 +432,12 @@ if stored_stock_count is not None:
         stored_stock_count = int(stored_stock_count)
     except (TypeError, ValueError):
         stored_stock_count = None
+min_stock_count = 50
 if stored_stock_count is not None and stored_stock_count < 1000:
     stored_stock_count = 1000
-default_stock_count = clamp_int(stored_stock_count, 20, max_stock_count, 1000)
+default_stock_count = clamp_int(stored_stock_count, min_stock_count, max_stock_count, 1000)
 default_stock_count = int(round(default_stock_count / 50) * 50)
-default_stock_count = clamp_int(default_stock_count, 20, max_stock_count, 1000)
+default_stock_count = clamp_int(default_stock_count, min_stock_count, max_stock_count, 1000)
 default_auto_fetch_missing = bool(sample_defaults.get("auto_fetch_missing", False))
 
 with st.sidebar:
@@ -445,7 +446,7 @@ with st.sidebar:
     start_date = st.date_input("开始日期", value=default_start_date, key="sample_start_date")
     stock_count = st.slider(
         "股票数量",
-        min_value=20,
+        min_value=min_stock_count,
         max_value=max_stock_count,
         value=default_stock_count,
         step=50,
