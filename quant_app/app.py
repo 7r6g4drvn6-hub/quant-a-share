@@ -456,6 +456,30 @@ with st.sidebar:
         value=default_auto_fetch_missing,
         key="sample_auto_fetch_missing",
     )
+    realtime_scan_max = max(20, min(int(stock_count), 1500))
+    realtime_scan_default = clamp_int(
+        sample_defaults.get("realtime_scan_count"),
+        20,
+        realtime_scan_max,
+        min(300, realtime_scan_max),
+    )
+    stored_realtime_scan = st.session_state.get("sample_realtime_scan_count")
+    if stored_realtime_scan is not None:
+        try:
+            stored_realtime_scan = int(stored_realtime_scan)
+        except (TypeError, ValueError):
+            stored_realtime_scan = None
+        if stored_realtime_scan is None or not 20 <= stored_realtime_scan <= realtime_scan_max:
+            del st.session_state["sample_realtime_scan_count"]
+    realtime_scan_count = st.slider(
+        "实时扫描数量",
+        min_value=20,
+        max_value=realtime_scan_max,
+        value=realtime_scan_default,
+        step=20,
+        key="sample_realtime_scan_count",
+    )
+    st.caption("股票池可放大；盘中实时模块只扫描成交额靠前的实时样本，避免网页首屏卡死。")
 
     st.subheader("策略")
     ma_short = st.slider("短均线", min_value=5, max_value=60, value=20, step=1)
@@ -488,6 +512,7 @@ current_sample_defaults = {
     "start_date": start_date.isoformat(),
     "end_date": end_date.isoformat(),
     "stock_count": int(stock_count),
+    "realtime_scan_count": int(realtime_scan_count),
     "auto_fetch_missing": bool(auto_fetch_missing),
 }
 if sample_defaults != current_sample_defaults:
@@ -506,6 +531,7 @@ except Exception as exc:  # noqa: BLE001 - show data-source failures in app.
 
 universe = liquid_universe(stock_list, stock_count)
 selected_codes = universe["code"].tolist()
+realtime_codes = selected_codes[: min(len(selected_codes), int(realtime_scan_count))]
 min_avg_amount = min_avg_amount_yi * 100000000
 min_realtime_amount = min_realtime_amount_yi * 100000000
 
@@ -567,11 +593,12 @@ market_tab, realtime_tab, operation_tab, prediction_tab, data_tab, backtest_tab,
 realtime_run_every = refresh_seconds if realtime_auto_refresh else None
 
 with market_tab:
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("样本/股票池", f"{len(selected_codes)}/{len(stock_list)}")
-    col2.metric("缓存可用", f"{len(bars_by_code)}")
-    col3.metric("回测交易日", f"{len(equity)}")
-    col4.metric("最新列表", str(stock_list["updated_at"].iloc[0]) if "updated_at" in stock_list else "-")
+    col2.metric("实时扫描", f"{len(realtime_codes)}")
+    col3.metric("缓存可用", f"{len(bars_by_code)}")
+    col4.metric("回测交易日", f"{len(equity)}")
+    col5.metric("最新列表", str(stock_list["updated_at"].iloc[0]) if "updated_at" in stock_list else "-")
 
     @st.fragment(run_every=realtime_run_every)
     def market_index_panel() -> None:
@@ -643,13 +670,13 @@ with market_tab:
             st.caption("行情预测是基于指数历史相似状态的概率信号，不是确定性判断。")
 
         st.subheader("板块行情判断")
-        board_sample_size = min(len(selected_codes), 300)
+        board_sample_size = min(len(realtime_codes), 300)
         st.caption(
-            f"点击后会基于当前样本中成交额靠前 {board_sample_size} 只股票生成板块判断，"
+            f"点击后会基于实时扫描样本中成交额靠前 {board_sample_size} 只股票生成板块判断，"
             "避免首屏自动拉取过多实时行情。"
         )
         if st.button("生成板块行情判断", width="stretch"):
-            board_codes = selected_codes[:board_sample_size]
+            board_codes = realtime_codes[:board_sample_size]
             try:
                 board_quotes = cached_realtime_quotes(tuple(board_codes))
             except Exception as exc:  # noqa: BLE001
@@ -704,7 +731,7 @@ with realtime_tab:
     @st.fragment(run_every=realtime_run_every)
     def realtime_panel() -> None:
         realtime_quotes, realtime_error, realtime_picks, _, _ = realtime_state(
-            selected_codes,
+            realtime_codes,
             panel,
             min_avg_amount,
             min_listed_days,
@@ -715,7 +742,7 @@ with realtime_tab:
             prediction_min_samples,
         )
         metric_cols = st.columns(4)
-        metric_cols[0].metric("实时样本", f"{len(realtime_quotes)}")
+        metric_cols[0].metric("实时样本", f"{len(realtime_quotes)}/{len(realtime_codes)}")
         metric_cols[1].metric("候选股", f"{len(realtime_picks)}")
         metric_cols[2].metric("刷新间隔", f"{refresh_seconds}s" if realtime_auto_refresh else "手动")
         latest_quote_time = "-"
@@ -724,6 +751,7 @@ with realtime_tab:
             if not latest_quote.empty:
                 latest_quote_time = latest_quote.max().strftime("%Y-%m-%d %H:%M:%S")
         metric_cols[3].metric("行情时间", latest_quote_time)
+        st.caption(f"当前实时模块扫描成交额靠前 {len(realtime_codes)} 只；要扩大范围可调左侧“实时扫描数量”。")
 
         if realtime_error:
             st.warning(f"实时行情加载失败：{realtime_error}")
@@ -783,8 +811,9 @@ with operation_tab:
     @st.fragment(run_every=realtime_run_every)
     def operation_panel() -> None:
         operation_scope = max(top_n, max_buy_candidates * 4, 60)
+        operation_codes = selected_codes[: min(len(selected_codes), max(len(realtime_codes), operation_scope))]
         _, realtime_error, _, _, operations = realtime_state(
-            selected_codes,
+            operation_codes,
             panel,
             min_avg_amount,
             min_listed_days,
@@ -908,7 +937,7 @@ with prediction_tab:
     @st.fragment(run_every=realtime_run_every)
     def prediction_panel() -> None:
         _, _, _, predictions, _ = realtime_state(
-            selected_codes,
+            realtime_codes,
             panel,
             min_avg_amount,
             min_listed_days,
@@ -1017,7 +1046,7 @@ with pick_tab:
         @st.fragment(run_every=realtime_run_every)
         def intraday_pick_panel() -> None:
             realtime_quotes, realtime_error, realtime_picks, _, _ = realtime_state(
-                selected_codes,
+                realtime_codes,
                 panel,
                 min_avg_amount,
                 min_listed_days,
@@ -1028,7 +1057,7 @@ with pick_tab:
                 prediction_min_samples,
             )
             metric_cols = st.columns(4)
-            metric_cols[0].metric("实时样本", f"{len(realtime_quotes)}")
+            metric_cols[0].metric("实时样本", f"{len(realtime_quotes)}/{len(realtime_codes)}")
             metric_cols[1].metric("入选股票", f"{len(realtime_picks)}")
             metric_cols[2].metric("刷新方式", f"{refresh_seconds}s" if realtime_auto_refresh else "手动")
             latest_quote_time = "-"
