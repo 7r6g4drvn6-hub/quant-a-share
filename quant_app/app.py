@@ -425,7 +425,7 @@ default_start_date = parse_date_default(
 )
 if default_start_date > default_end_date:
     default_start_date = default_end_date - timedelta(days=730)
-max_stock_count = 5000
+max_stock_count = 1500
 stored_stock_count = sample_defaults.get("stock_count")
 if stored_stock_count is not None:
     try:
@@ -433,34 +433,73 @@ if stored_stock_count is not None:
     except (TypeError, ValueError):
         stored_stock_count = None
 min_stock_count = 50
-if stored_stock_count is not None and stored_stock_count < 1000:
-    stored_stock_count = 1000
-default_stock_count = clamp_int(stored_stock_count, min_stock_count, max_stock_count, 1000)
+default_stock_count = clamp_int(stored_stock_count, min_stock_count, max_stock_count, 800)
 default_stock_count = int(round(default_stock_count / 50) * 50)
-default_stock_count = clamp_int(default_stock_count, min_stock_count, max_stock_count, 1000)
+default_stock_count = clamp_int(default_stock_count, min_stock_count, max_stock_count, 800)
 default_auto_fetch_missing = bool(sample_defaults.get("auto_fetch_missing", False))
 
 with st.sidebar:
     st.subheader("样本")
     end_date = st.date_input("结束日期", value=default_end_date, key="sample_end_date")
     start_date = st.date_input("开始日期", value=default_start_date, key="sample_start_date")
+    stored_sample_count = st.session_state.get("sample_stock_count")
+    if stored_sample_count is not None:
+        try:
+            stored_sample_count = int(stored_sample_count)
+        except (TypeError, ValueError):
+            stored_sample_count = None
+        if stored_sample_count is None or not min_stock_count <= stored_sample_count <= max_stock_count:
+            del st.session_state["sample_stock_count"]
     stock_count = st.slider(
-        "股票数量",
+        "股票池数量",
         min_value=min_stock_count,
         max_value=max_stock_count,
         value=default_stock_count,
         step=50,
         key="sample_stock_count",
     )
+    daily_sample_max = max(min_stock_count, int(stock_count))
+    daily_sample_default = clamp_int(
+        sample_defaults.get("daily_sample_count"),
+        min_stock_count,
+        daily_sample_max,
+        min(300, daily_sample_max),
+    )
+    daily_sample_default = int(round(daily_sample_default / 50) * 50)
+    daily_sample_default = clamp_int(daily_sample_default, min_stock_count, daily_sample_max, min(300, daily_sample_max))
+    stored_daily_sample = st.session_state.get("sample_daily_count")
+    if stored_daily_sample is not None:
+        try:
+            stored_daily_sample = int(stored_daily_sample)
+        except (TypeError, ValueError):
+            stored_daily_sample = None
+        if stored_daily_sample is None or not min_stock_count <= stored_daily_sample <= daily_sample_max:
+            del st.session_state["sample_daily_count"]
+    daily_sample_count = st.slider(
+        "日线更新数量",
+        min_value=min_stock_count,
+        max_value=daily_sample_max,
+        value=daily_sample_default,
+        step=50,
+        key="sample_daily_count",
+    )
     auto_fetch_missing = st.toggle(
         "缺失数据自动补齐",
         value=default_auto_fetch_missing,
         key="sample_auto_fetch_missing",
     )
-    realtime_scan_max = max(20, min(int(stock_count), 1500))
+    min_realtime_scan_count = 50
+    realtime_scan_max = max(min_realtime_scan_count, min(int(stock_count), 800))
     realtime_scan_default = clamp_int(
         sample_defaults.get("realtime_scan_count"),
-        20,
+        min_realtime_scan_count,
+        realtime_scan_max,
+        min(300, realtime_scan_max),
+    )
+    realtime_scan_default = int(round(realtime_scan_default / 50) * 50)
+    realtime_scan_default = clamp_int(
+        realtime_scan_default,
+        min_realtime_scan_count,
         realtime_scan_max,
         min(300, realtime_scan_max),
     )
@@ -470,17 +509,17 @@ with st.sidebar:
             stored_realtime_scan = int(stored_realtime_scan)
         except (TypeError, ValueError):
             stored_realtime_scan = None
-        if stored_realtime_scan is None or not 20 <= stored_realtime_scan <= realtime_scan_max:
+        if stored_realtime_scan is None or not min_realtime_scan_count <= stored_realtime_scan <= realtime_scan_max:
             del st.session_state["sample_realtime_scan_count"]
     realtime_scan_count = st.slider(
         "实时扫描数量",
-        min_value=20,
+        min_value=min_realtime_scan_count,
         max_value=realtime_scan_max,
         value=realtime_scan_default,
-        step=20,
+        step=50,
         key="sample_realtime_scan_count",
     )
-    st.caption("股票池可放大；盘中实时模块只扫描成交额靠前的实时样本，避免网页首屏卡死。")
+    st.caption("股票池只做大范围排序；日线和实时模块分别按上面两个数量运行，避免更新太慢。")
 
     st.subheader("策略")
     ma_short = st.slider("短均线", min_value=5, max_value=60, value=20, step=1)
@@ -507,12 +546,13 @@ with st.sidebar:
     prediction_min_samples = st.slider("最少历史样本", min_value=10, max_value=120, value=40, step=10)
 
     refresh_list = st.button("刷新股票列表", width="stretch")
-    update_prices = st.button("更新样本日线", type="primary", width="stretch")
+    update_prices = st.button("更新日线样本", type="primary", width="stretch")
 
 current_sample_defaults = {
     "start_date": start_date.isoformat(),
     "end_date": end_date.isoformat(),
     "stock_count": int(stock_count),
+    "daily_sample_count": int(daily_sample_count),
     "realtime_scan_count": int(realtime_scan_count),
     "auto_fetch_missing": bool(auto_fetch_missing),
 }
@@ -532,6 +572,7 @@ except Exception as exc:  # noqa: BLE001 - show data-source failures in app.
 
 universe = liquid_universe(stock_list, stock_count)
 selected_codes = universe["code"].tolist()
+daily_codes = selected_codes[: min(len(selected_codes), int(daily_sample_count))]
 realtime_codes = selected_codes[: min(len(selected_codes), int(realtime_scan_count))]
 min_avg_amount = min_avg_amount_yi * 100000000
 min_realtime_amount = min_realtime_amount_yi * 100000000
@@ -544,15 +585,15 @@ if update_prices:
         progress.progress(idx / max(total, 1))
         status.write(f"{idx}/{total} {code} {state}")
 
-    with st.spinner("更新行情中"):
-        _, update_errors = update_daily_cache(selected_codes, start_date, end_date, progress=progress_cb)
+    with st.spinner(f"更新 {len(daily_codes)} 只日线样本中"):
+        _, update_errors = update_daily_cache(daily_codes, start_date, end_date, progress=progress_cb)
     if update_errors:
         st.warning(f"{len(update_errors)} 只股票更新失败，已跳过。")
         st.dataframe(table_view(pd.DataFrame(update_errors, columns=["code", "error"])), width="stretch", hide_index=True)
     else:
-        st.success("样本日线已更新。")
+        st.success("日线样本已更新。")
 
-bars_by_code, missing_codes = load_cached_bars_for_codes(selected_codes, start_date, end_date)
+bars_by_code, missing_codes = load_cached_bars_for_codes(daily_codes, start_date, end_date)
 auto_fetch_limit = 200
 if missing_codes and auto_fetch_missing and len(missing_codes) <= auto_fetch_limit:
     with st.spinner(f"补齐 {len(missing_codes)} 只股票的日线"):
@@ -563,10 +604,10 @@ if missing_codes and auto_fetch_missing and len(missing_codes) <= auto_fetch_lim
 elif missing_codes and auto_fetch_missing:
     st.info(
         f"有 {len(missing_codes)} 只股票缺少日线缓存，数量较大，已跳过自动补齐以避免页面卡住。"
-        "实时行情仍会覆盖全部样本；回测、日线选股和个股预测需要点击“更新样本日线”补齐。"
+        "实时行情仍会覆盖实时样本；回测、日线选股和个股预测需要点击“更新日线样本”补齐。"
     )
 elif missing_codes:
-    st.info(f"有 {len(missing_codes)} 只股票缺少日线缓存。实时行情仍会覆盖全部样本；回测、日线选股和个股预测需要点击“更新样本日线”补齐。")
+    st.info(f"有 {len(missing_codes)} 只日线样本缺少缓存。实时行情仍会覆盖实时样本；回测、日线选股和个股预测需要点击“更新日线样本”补齐。")
 
 panel = build_panel(
     bars_by_code,
@@ -595,7 +636,7 @@ realtime_run_every = refresh_seconds if realtime_auto_refresh else None
 
 with market_tab:
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("样本/股票池", f"{len(selected_codes)}/{len(stock_list)}")
+    col1.metric("日线/股票池", f"{len(daily_codes)}/{len(selected_codes)}")
     col2.metric("实时扫描", f"{len(realtime_codes)}")
     col3.metric("缓存可用", f"{len(bars_by_code)}")
     col4.metric("回测交易日", f"{len(equity)}")
@@ -1106,7 +1147,7 @@ with pick_tab:
         if trade_date is None or picks.empty:
             st.warning("当前参数下没有日线候选股票。")
         else:
-            st.caption(f"日线交易日：{trade_date.date()}。日线选股基于本地日线缓存，只有点击“更新样本日线”后才会变。")
+            st.caption(f"日线交易日：{trade_date.date()}。日线选股基于本地日线缓存，只有点击“更新日线样本”后才会变。")
             neutral_picks = add_group_neutral_rank(picks, factor_snapshot, max_per_group, top_n)
             show_picks = neutral_picks if not neutral_picks.empty else picks
             display = table_view(
@@ -1129,7 +1170,7 @@ with pick_tab:
 
 with risk_tab:
     if factor_snapshot.empty:
-        st.warning("暂无风控数据。请先更新样本日线。")
+        st.warning("暂无风控数据。请先更新日线样本。")
     else:
         st.subheader("股票池因子")
         factor_cols = st.columns(4)
@@ -1162,7 +1203,7 @@ with risk_tab:
 
         latest_positions = holdings[holdings["date"] == holdings["date"].max()] if not holdings.empty else pd.DataFrame()
         if latest_positions.empty:
-            st.info("暂无回测最新持仓，无法计算组合暴露。更新样本日线并跑出回测后会显示。")
+            st.info("暂无回测最新持仓，无法计算组合暴露。更新日线样本并跑出回测后会显示。")
         else:
             st.subheader("组合分组暴露")
             group_view = group_exposure(latest_positions, factor_snapshot)
@@ -1254,7 +1295,8 @@ with detail_tab:
     if panel.empty:
         st.warning("暂无个股数据。")
     else:
-        options = universe["code"] + " " + universe["name"]
+        detail_universe = universe[universe["code"].isin(panel["code"].unique())].copy()
+        options = detail_universe["code"] + " " + detail_universe["name"]
         selected = st.selectbox("股票", options.tolist())
         code = selected.split(" ")[0]
         stock_name = selected.split(" ", 1)[1] if " " in selected else code
